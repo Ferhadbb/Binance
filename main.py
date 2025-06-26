@@ -1,36 +1,48 @@
-
+import os
 import time
 import threading
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
-import requests
 import json
 from datetime import datetime, timedelta
 from flask import Flask
 from threading import Thread
+import requests
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    CallbackQueryHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
 
-flask_app = Flask('')
+# Flask app to keep Railway happy
+app = Flask(__name__)
 
-@flask_app.route('/')
+@app.route('/')
 def home():
     return "Binance Bot Alive"
 
-def run():
-    flask_app.run(host='0.0.0.0', port=8080)
+def run_flask():
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host='0.0.0.0', port=port)
 
 def keep_alive():
-    t = Thread(target=run)
+    t = Thread(target=run_flask)
     t.start()
 
-BOT_TOKEN = "8089281633:AAHPCk5F4nyX6ziF8Su9AXBQvVfqnwPEATw"
+# Load Telegram bot token from env var
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+if not BOT_TOKEN:
+    print("Error: BOT_TOKEN environment variable not set")
+    exit(1)
 
 scan_interval = 60
 target_yield = 0.01
 last_found = None
 running = False
-user_chat_id = 5477623800
+user_chat_id = None  # Will be set on /start command
 
-# Trade tracking
 trades_file = "trades.json"
 
 def load_trades():
@@ -84,15 +96,17 @@ def calculate_stats(trades, days):
     total_profit = sum(t['profit'] for t in filtered_trades)
     avg_profit = total_profit / total_trades if total_trades > 0 else 0
     
-    return f"📊 Stats ({days} days):\n" \
-           f"🔢 Total trades: {total_trades}\n" \
-           f"💰 Total invested: {total_investment:.2f} AZN\n" \
-           f"📈 Total profit: {total_profit:.2f} AZN\n" \
-           f"📊 Average profit: {avg_profit:.2f} AZN\n" \
-           f"📊 ROI: {(total_profit/total_investment*100):.2f}%" if total_investment > 0 else f"📊 Stats ({days} days):\n🔢 Total trades: {total_trades}\n💰 Total invested: {total_investment:.2f} AZN\n📈 Total profit: {total_profit:.2f} AZN\n📊 Average profit: {avg_profit:.2f} AZN"
+    roi = (total_profit / total_investment * 100) if total_investment > 0 else 0
+
+    return (f"📊 Stats ({days} days):\n"
+            f"🔢 Total trades: {total_trades}\n"
+            f"💰 Total invested: {total_investment:.2f} AZN\n"
+            f"📈 Total profit: {total_profit:.2f} AZN\n"
+            f"📊 Average profit: {avg_profit:.2f} AZN\n"
+            f"📊 ROI: {roi:.2f}%")
 
 def scan_binance():
-    global last_found
+    global last_found, user_chat_id
     try:
         buy_resp = requests.post("https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search", json={
             "page": 1,
@@ -119,7 +133,11 @@ def scan_binance():
         last_found = (best_buy, best_sell, profit)
 
         if profit >= target_yield and user_chat_id:
-            message = f"💰 Opportunity Found!\n\n🟢 Buy at: {best_buy} AZN\n🔴 Sell at: {best_sell} AZN\n📈 Profit: {profit} AZN\n\nDid you take this trade?"
+            message = (f"💰 Opportunity Found!\n\n"
+                       f"🟢 Buy at: {best_buy} AZN\n"
+                       f"🔴 Sell at: {best_sell} AZN\n"
+                       f"📈 Profit: {profit} AZN\n\n"
+                       "Did you take this trade?")
             reply_markup = get_trade_decision_menu(best_buy, best_sell, profit)
             telegram_app.bot.send_message(chat_id=user_chat_id, text=message, reply_markup=reply_markup)
 
@@ -136,7 +154,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global user_chat_id
     user_chat_id = update.effective_chat.id
     status = "🟢 Running" if running else "🔴 Stopped"
-    message = f"👋 Welcome to Binance P2P Bot!\n\nStatus: {status}\nInterval: {scan_interval}s\nYield Target: {target_yield} AZN"
+    message = (f"👋 Welcome to Binance P2P Bot!\n\n"
+               f"Status: {status}\n"
+               f"Interval: {scan_interval}s\n"
+               f"Yield Target: {target_yield} AZN")
     await update.message.reply_text(message, reply_markup=get_main_menu())
 
 async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -147,19 +168,24 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if query.data == 'main_menu':
         status = "🟢 Running" if running else "🔴 Stopped"
-        message = f"🏠 Main Menu\n\nStatus: {status}\nInterval: {scan_interval}s\nYield Target: {target_yield} AZN"
+        message = (f"🏠 Main Menu\n\n"
+                   f"Status: {status}\n"
+                   f"Interval: {scan_interval}s\n"
+                   f"Yield Target: {target_yield} AZN")
         await query.edit_message_text(message, reply_markup=get_main_menu())
     
     elif query.data == 'settings':
-        message = f"⚙️ Settings\n\nCurrent interval: {scan_interval}s\nCurrent yield target: {target_yield} AZN"
+        message = (f"⚙️ Settings\n\n"
+                   f"Current interval: {scan_interval}s\n"
+                   f"Current yield target: {target_yield} AZN")
         await query.edit_message_text(message, reply_markup=get_settings_menu())
     
     elif query.data.startswith('stats_'):
         trades = load_trades()
         period = query.data.split('_')[1]
-        days = {'daily': 1, 'weekly': 7, 'monthly': 30}[period]
+        days_map = {'daily': 1, 'weekly': 7, 'monthly': 30}
+        days = days_map.get(period, 1)
         stats = calculate_stats(trades, days)
-        # Add timestamp to make message unique
         stats += f"\n\n🕐 Updated: {datetime.now().strftime('%H:%M:%S')}"
         await query.edit_message_text(stats, reply_markup=get_main_menu())
     
@@ -169,7 +195,7 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             message = "📋 No trades recorded yet."
         else:
             message = "📋 All Trades:\n\n"
-            for i, trade in enumerate(trades[-10:], 1):  # Show last 10 trades
+            for i, trade in enumerate(trades[-10:], 1):
                 date = datetime.fromisoformat(trade['date']).strftime("%m/%d %H:%M")
                 message += f"{i}. {date} - {trade['amount']:.2f} AZN → +{trade['profit']:.2f} AZN\n"
             if len(trades) > 10:
@@ -179,7 +205,11 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif query.data == 'check':
         scan_binance()
         if last_found:
-            message = f"✅ Manual Check:\n🟢 Buy: {last_found[0]} AZN\n🔴 Sell: {last_found[1]} AZN\n📈 Profit: {last_found[2]} AZN\n\n🕐 {datetime.now().strftime('%H:%M:%S')}"
+            message = (f"✅ Manual Check:\n"
+                       f"🟢 Buy: {last_found[0]} AZN\n"
+                       f"🔴 Sell: {last_found[1]} AZN\n"
+                       f"📈 Profit: {last_found[2]} AZN\n\n"
+                       f"🕐 {datetime.now().strftime('%H:%M:%S')}")
             if last_found[2] >= target_yield:
                 message += "\n\nDid you take this trade?"
                 reply_markup = get_trade_decision_menu(last_found[0], last_found[1], last_found[2])
@@ -257,7 +287,9 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             trades.append(trade)
             save_trades(trades)
             
-            message = f"✅ Trade recorded!\n💰 Amount: {amount:.2f} AZN\n📈 Profit: {profit:.2f} AZN"
+            message = (f"✅ Trade recorded!\n"
+                       f"💰 Amount: {amount:.2f} AZN\n"
+                       f"📈 Profit: {profit:.2f} AZN")
             await update.message.reply_text(message, reply_markup=get_main_menu())
             context.user_data['pending_trade'] = None
         except:
@@ -268,7 +300,6 @@ telegram_app.add_handler(CommandHandler("start", start))
 telegram_app.add_handler(CallbackQueryHandler(handle_buttons))
 telegram_app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), text_handler))
 
-# 👇 Call this when bot starts
 keep_alive()
 
 print("✅ Bot is running...")
